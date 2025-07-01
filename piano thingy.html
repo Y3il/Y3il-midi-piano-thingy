@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>88-Key MIDI Synth with Sustain & Fade In Fix</title>
+<style>
+  body {
+    margin: 0;
+    background-color: #1e1e1e;
+    font-family: sans-serif;
+    color: white;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding-top: 20px;
+    overflow: hidden;
+  }
+
+  #status {
+    margin: 10px;
+  }
+
+  #controls {
+    margin-bottom: 20px;
+    display: flex;
+    gap: 15px;
+    align-items: center;
+    flex-wrap: wrap;
+    justify-content: center;
+    width: 90vw;
+    max-width: 1200px;
+  }
+
+  label {
+    font-size: 14px;
+  }
+
+  input[type="range"] {
+    -webkit-appearance: none;
+    width: 150px;
+    height: 5px;
+    border-radius: 5px;
+    background: #555;
+    cursor: pointer;
+  }
+
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #6f00ff;
+    cursor: pointer;
+    border: none;
+    margin-top: -5.5px;
+    transition: background-color 0.3s ease;
+  }
+
+  input[type="range"]:hover::-webkit-slider-thumb {
+    background-color: #a967ff;
+  }
+
+  #keyboard-container {
+    overflow-x: auto;
+    width: 100%;
+    max-width: 100vw;
+    border-top: 2px solid #444;
+    border-bottom: 2px solid #444;
+    padding-bottom: 10px;
+  }
+
+  #keyboard {
+    position: relative;
+    height: 200px;
+    user-select: none;
+    width: calc(52 * 40px);
+  }
+
+  .white-key,
+  .black-key {
+    user-select: none;
+    cursor: pointer;
+    touch-action: none;
+    transition: background-color 0.15s ease;
+    box-sizing: border-box;
+  }
+
+  .white-key {
+    width: 40px;
+    height: 200px;
+    background: white;
+    border: 1px solid #aaa;
+    position: relative;
+    float: left;
+    display: flex;
+    justify-content: center;
+    align-items: flex-end;
+    font-size: 10px;
+    padding-bottom: 5px;
+    color: black;
+    z-index: 1;
+  }
+
+  .black-key {
+    width: 25px;
+    height: 120px;
+    background: black;
+    position: absolute;
+    top: 0;
+    z-index: 2;
+    display: flex;
+    justify-content: center;
+    align-items: flex-end;
+    font-size: 10px;
+    padding-bottom: 5px;
+    color: white;
+    margin-left: -12.5px;
+    border-radius: 0 0 5px 5px;
+    box-shadow: 0 3px 6px rgba(0, 0, 0, 0.7);
+  }
+
+  /* Highlight colors */
+  .key.pressed {
+    background-color: #6f00ff !important;
+    color: white !important;
+  }
+
+  .key.sustained {
+    background-color: #a967ff !important;
+    color: white !important;
+  }
+
+  select {
+    font-size: 14px;
+    padding: 4px;
+    border-radius: 5px;
+    border: none;
+    background: #333;
+    color: white;
+  }
+</style>
+</head>
+<body>
+  <div id="status">Waiting for MIDI input...</div>
+  <div id="controls">
+    <label for="waveform">Waveform:</label>
+    <select id="waveform">
+      <option value="sine">Sine</option>
+      <option value="square">Square</option>
+      <option value="triangle">Triangle</option>
+      <option value="sawtooth">Sawtooth</option>
+    </select>
+
+    <label for="volume">Master Volume:</label>
+    <input type="range" id="volume" min="0" max="1" step="0.01" value="0.5" />
+  </div>
+
+  <div id="keyboard-container">
+    <div id="keyboard"></div>
+  </div>
+
+  <script>
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    const audioCtx = new AudioContext();
+    const keyboard = document.getElementById('keyboard');
+    const statusText = document.getElementById('status');
+    const waveformSelector = document.getElementById('waveform');
+    const volumeControl = document.getElementById('volume');
+
+    const noteNames = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+    const startNote = 21; // A0
+    const endNote = 108; // C8
+
+    const activeOscillators = {};
+    let sustainOn = false;
+    const sustainedNotes = new Set();
+
+    // Master volume control
+    const masterGain = audioCtx.createGain();
+    masterGain.gain.value = volumeControl.value;
+    masterGain.connect(audioCtx.destination);
+
+    volumeControl.addEventListener('input', () => {
+      masterGain.gain.value = volumeControl.value;
+    });
+
+    // Helper: Is black key?
+    function isBlackKey(midiNote) {
+      const noteIndex = midiNote % 12;
+      return [1, 3, 6, 8, 10].includes(noteIndex);
+    }
+
+    // Helper: Note label
+    function noteLabel(midiNote) {
+      const noteIndex = midiNote % 12;
+      const octave = Math.floor(midiNote / 12) - 1;
+      return noteNames[noteIndex] + octave;
+    }
+
+    // Build mapping: midiNote -> whiteKeyIndex
+    const midiToWhiteIndex = {};
+    let whiteIndex = 0;
+    for (let midi = startNote; midi <= endNote; midi++) {
+      if (!isBlackKey(midi)) {
+        midiToWhiteIndex[midi] = whiteIndex++;
+      }
+    }
+
+    // Create white keys
+    const whiteKeyWidth = 40;
+    const blackKeyWidth = 25;
+    for (let midi = startNote; midi <= endNote; midi++) {
+      if (!isBlackKey(midi)) {
+        const key = document.createElement('div');
+        key.className = 'white-key key';
+        key.dataset.note = midi;
+        key.textContent = noteLabel(midi);
+        keyboard.appendChild(key);
+      }
+    }
+
+    // Create black keys positioned correctly
+    for (let midi = startNote; midi <= endNote; midi++) {
+      if (isBlackKey(midi)) {
+        const key = document.createElement('div');
+        key.className = 'black-key key';
+        key.dataset.note = midi;
+        key.textContent = noteLabel(midi);
+
+        // Find white key to the left of this black key
+        const noteIndex = midi % 12;
+
+        let whiteKeyToLeftMidi;
+        switch (noteIndex) {
+          case 1: // C#
+          case 3: // D#
+          case 6: // F#
+          case 8: // G#
+          case 10: // A#
+            whiteKeyToLeftMidi = midi - 1;
+            break;
+          default:
+            whiteKeyToLeftMidi = null;
+        }
+
+        if (
+          whiteKeyToLeftMidi === null ||
+          midiToWhiteIndex[whiteKeyToLeftMidi] === undefined
+        ) {
+          continue;
+        }
+
+        const whiteKeyPos = midiToWhiteIndex[whiteKeyToLeftMidi] * whiteKeyWidth;
+        key.style.left = whiteKeyPos + whiteKeyWidth - blackKeyWidth / 2 + 'px';
+
+        keyboard.appendChild(key);
+      }
+    }
+
+    // Add mouse/touch event listeners
+    function attachKeyEvents(key, note) {
+      const start = () => {
+        noteOn(note, 100);
+      };
+      const stop = () => {
+        noteOff(note);
+      };
+
+      key.addEventListener('mousedown', start);
+      key.addEventListener('mouseup', stop);
+      key.addEventListener('mouseleave', stop);
+
+      key.addEventListener(
+        'touchstart',
+        (e) => {
+          e.preventDefault();
+          start();
+        },
+        { passive: false }
+      );
+
+      key.addEventListener('touchend', (e) => {
+        e.preventDefault();
+        stop();
+      });
+    }
+
+    document.querySelectorAll('.key').forEach((key) => {
+      attachKeyEvents(key, +key.dataset.note);
+    });
+
+    // Convert MIDI note to frequency
+    function midiToFrequency(note) {
+      return 440 * Math.pow(2, (note - 69) / 12);
+    }
+
+    // Highlight keys
+    function highlightKeyPressed(note) {
+      const el = [...document.querySelectorAll('.key')].find(
+        (k) => +k.dataset.note === note
+      );
+      if (el) {
+        el.classList.add('pressed');
+        el.classList.remove('sustained');
+      }
+    }
+
+    function highlightKeySustained(note) {
+      const el = [...document.querySelectorAll('.key')].find(
+        (k) => +k.dataset.note === note
+      );
+      if (el) {
+        el.classList.remove('pressed');
+        el.classList.add('sustained');
+      }
+    }
+
+    function clearHighlight(note) {
+      const el = [...document.querySelectorAll('.key')].find(
+        (k) => +k.dataset.note === note
+      );
+      if (el) {
+        el.classList.remove('pressed');
+        el.classList.remove('sustained');
+      }
+    }
+
+    // Fade timeout handlers
+    const fadeTimeouts = {};
+
+    function noteOn(note, velocity = 127) {
+      // Cancel any fade out and stop old oscillator for same note to allow re-hit
+      if (fadeTimeouts[note]) {
+        clearTimeout(fadeTimeouts[note]);
+        fadeTimeouts[note] = null;
+      }
+      if (activeOscillators[note]) {
+        // Stop current oscillator immediately to restart with fade-in
+        activeOscillators[note].osc.stop();
+        delete activeOscillators[note];
+        clearHighlight(note);
+      }
+
+      const freq = midiToFrequency(note);
+      const osc = audioCtx.createOscillator();
+      const gainNode = audioCtx.createGain();
+
+      const now = audioCtx.currentTime;
+      const targetGain = velocity / 127;
+
+      osc.type = waveformSelector.value;
+      osc.frequency.value = freq;
+
+      gainNode.gain.setValueAtTime(0.0001, now);
+      gainNode.gain.linearRampToValueAtTime(targetGain, now + 0.03);
+
+      osc.connect(gainNode).connect(masterGain);
+      osc.start();
+
+      activeOscillators[note] = { osc, gainNode };
+      sustainedNotes.delete(note);
+
+      highlightKeyPressed(note);
+      statusText.textContent = `Note ON: ${note}`;
+    }
+
+    function stopNoteImmediate(note) {
+      const active = activeOscillators[note];
+      if (active) {
+        const now = audioCtx.currentTime;
+        active.gainNode.gain.cancelScheduledValues(now);
+        active.gainNode.gain.setValueAtTime(active.gainNode.gain.value, now);
+        active.gainNode.gain.exponentialRampToValueAtTime(0.0001, now + 0.05);
+        active.osc.stop(now + 0.05);
+
+        delete activeOscillators[note];
+        clearHighlight(note);
+        statusText.textContent = `Note OFF: ${note}`;
+      }
+    }
+
+    function fadeOutNoteLong(note) {
+      const active = activeOscillators[note];
+      if (!active) return;
+
+      const now = audioCtx.currentTime;
+      active.gainNode.gain.cancelScheduledValues(now);
+      active.gainNode.gain.setValueAtTime(active.gainNode.gain.value, now);
+      active.gainNode.gain.exponentialRampToValueAtTime(0.0001, now + 8);
+
+      fadeTimeouts[note] = setTimeout(() => {
+        if (activeOscillators[note]) {
+          active.osc.stop();
+          delete activeOscillators[note];
+          clearHighlight(note);
+          statusText.textContent = `Sustained Note OFF (fade out done): ${note}`;
+        }
+        fadeTimeouts[note] = null;
+      }, 8000);
+
+      highlightKeySustained(note);
+    }
+
+    function noteOff(note) {
+      if (!activeOscillators[note]) return;
+
+      if (sustainOn) {
+        sustainedNotes.add(note);
+        fadeOutNoteLong(note);
+        return;
+      }
+
+      stopNoteImmediate(note);
+    }
+
+    function handleMIDIMessage(event) {
+      const [command, note, velocity] = event.data;
+
+      // Sustain pedal (CC64)
+      if (command === 176 && note === 64) {
+        sustainOn = velocity >= 64;
+        statusText.textContent = sustainOn
+          ? 'Sustain pedal ON'
+          : 'Sustain pedal OFF';
+
+        if (!sustainOn) {
+          // Cancel long fade and do quick fade (0.5s) on pedal release
+          for (let n of sustainedNotes) {
+            const active = activeOscillators[n];
+            if (!active) continue;
+            const now = audioCtx.currentTime;
+
+            // Cancel any running long fade timeout
+            if (fadeTimeouts[n]) {
+              clearTimeout(fadeTimeouts[n]);
+              fadeTimeouts[n] = null;
+            }
+
+            active.gainNode.gain.cancelScheduledValues(now);
+            active.gainNode.gain.setValueAtTime(active.gainNode.gain.value, now);
+            active.gainNode.gain.exponentialRampToValueAtTime(0.0001, now + 0.5);
+            setTimeout(() => {
+              if (activeOscillators[n]) {
+                active.osc.stop();
+                delete activeOscillators[n];
+                clearHighlight(n);
+                statusText.textContent = `Sustained Note OFF (quick fade done): ${n}`;
+              }
+            }, 500);
+          }
+          sustainedNotes.clear();
+          document
+            .querySelectorAll('.key.sustained')
+            .forEach((el) => el.classList.remove('sustained'));
+        }
+        return;
+      }
+
+      if (note < startNote || note > endNote) return;
+
+      if (command === 144 && velocity > 0) {
+        noteOn(note, velocity);
+      } else if (command === 128 || (command === 144 && velocity === 0)) {
+        noteOff(note);
+      }
+    }
+
+    function onMIDISuccess(midiAccess) {
+      statusText.textContent = 'MIDI connected! You can also click or tap keys.';
+      for (let input of midiAccess.inputs.values()) {
+        input.onmidimessage = handleMIDIMessage;
+      }
+    }
+
+    function onMIDIFailure() {
+      statusText.textContent = 'Could not access your MIDI devices.';
+    }
+
+    navigator.requestMIDIAccess().then(onMIDISuccess, onMIDIFailure);
+
+    // Keyboard sustain pedal toggle (left shift)
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Shift' && !sustainOn) {
+        sustainOn = true;
+        statusText.textContent = 'Sustain pedal ON (Keyboard)';
+      }
+    });
+
+    window.addEventListener('keyup', (e) => {
+      if (e.key === 'Shift' && sustainOn) {
+        sustainOn = false;
+        statusText.textContent = 'Sustain pedal OFF (Keyboard)';
+        for (let n of sustainedNotes) {
+          const active = activeOscillators[n];
+          if (!active) continue;
+          const now = audioCtx.currentTime;
+
+          if (fadeTimeouts[n]) {
+            clearTimeout(fadeTimeouts[n]);
+            fadeTimeouts[n] = null;
+          }
+
+          active.gainNode.gain.cancelScheduledValues(now);
+          active.gainNode.gain.setValueAtTime(active.gainNode.gain.value, now);
+          active.gainNode.gain.exponentialRampToValueAtTime(0.0001, now + 0.5);
+          setTimeout(() => {
+            if (activeOscillators[n]) {
+              active.osc.stop();
+              delete activeOscillators[n];
+              clearHighlight(n);
+              statusText.textContent = `Sustained Note OFF (quick fade done): ${n}`;
+            }
+          }, 500);
+        }
+        sustainedNotes.clear();
+        document
+          .querySelectorAll('.key.sustained')
+          .forEach((el) => el.classList.remove('sustained'));
+      }
+    });
+  </script>
+</body>
+</html>
